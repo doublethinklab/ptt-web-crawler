@@ -12,6 +12,7 @@ import time
 import codecs
 from bs4 import BeautifulSoup
 from six import u
+from datetime import datetime
 
 __version__ = '1.0'
 
@@ -169,6 +170,9 @@ class PttWebCrawler(object):
         # print 'msgs', messages
         # print 'mscounts', message_count
 
+        date_ = datetime.strptime(date, '%a %b %d %H:%M:%S %Y').strftime('%Y-%m-%d')
+        time_ = datetime.strptime(date, '%a %b %d %H:%M:%S %Y').strftime('%H:%M:%S')
+
         # json data
         data = {
             'url': link,
@@ -176,7 +180,8 @@ class PttWebCrawler(object):
             'article_id': article_id,
             'article_title': title,
             'author': author,
-            'date': date,
+            'date': date_,
+            'time': time_,
             'content': content,
             'ip': ip,
             'message_count': message_count,
