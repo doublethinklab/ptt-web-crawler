@@ -102,7 +102,7 @@ class PttWebCrawler(object):
         if resp.status_code != 200:
             print('invalid url:', resp.url)
             return json.dumps({"error": "invalid url"}, sort_keys=True, ensure_ascii=False)
-        soup = BeautifulSoup(resp.text, 'html.parser')
+        soup = BeautifulSoup(resp.text, 'lxml')
         main_content = soup.find(id="main-content")
         metas = main_content.select('div.article-metaline')
         author = ''
