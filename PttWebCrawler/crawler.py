@@ -71,7 +71,7 @@ class PttWebCrawler(object):
                 if resp.status_code != 200:
                     print('invalid url:', resp.url)
                     continue
-                soup = BeautifulSoup(resp.text, 'html.parser')
+                soup = BeautifulSoup(resp.text, 'lxml')
                 divs = soup.find_all("div", "r-ent")
                 for div in divs:
                     try:
