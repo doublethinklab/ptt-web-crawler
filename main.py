@@ -9,11 +9,11 @@ import pymongo
 load_dotenv()
 
 c = PttWebCrawler(as_lib=True)
-c.parse_articles(0, 1000/20, 'HatePolitics')  # 1 index = 20 articles
-c.parse_articles(0, 1000/20, 'Gossiping')
-c.parse_articles(0, 500/20, 'Womentalk')
-c.parse_articles(0, 200/20, 'joke')
-c.parse_articles(0, 200/20, 'Military')
+c.parse_articles(0, 50, 'HatePolitics')  # 1 index = 20 articles
+c.parse_articles(0, 50, 'Gossiping')
+c.parse_articles(0, 25, 'Womentalk')
+c.parse_articles(0, 10, 'joke')
+c.parse_articles(0, 10, 'Military')
 
 client = pymongo.MongoClient(os.getenv('MONGODB_URI'))
 dtl_data = client['dtl_data']
