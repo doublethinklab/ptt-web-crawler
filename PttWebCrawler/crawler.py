@@ -89,9 +89,10 @@ class PttWebCrawler(object):
             self.store(filename, u']}', 'a')
             return filename
 
-    def parse_article(self, article_id, board, path='.'):
+    def parse_article(self, article_id, board, path='data'):
+        today = datetime.today().strftime('%Y%m%d')
         link = self.PTT_URL + '/bbs/' + board + '/' + article_id + '.html'
-        filename = board + '-' + article_id + '.json'
+        filename = board + '-' + article_id + '-' + today + '.json'
         filename = os.path.join(path, filename)
         self.store(filename, self.parse(link, article_id, board), 'w')
         return filename
@@ -203,8 +204,10 @@ class PttWebCrawler(object):
 
     @staticmethod
     def store(filename, data, mode):
-        with codecs.open(filename, mode, encoding='utf-8') as f:
-            f.write(data)
+        with open(filename, 'w') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        # with codecs.open(filename, mode, encoding='utf-8') as f:
+        #     f.write(data)
 
     @staticmethod
     def get(filename, mode='r'):
