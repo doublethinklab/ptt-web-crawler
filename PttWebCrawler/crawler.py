@@ -65,7 +65,7 @@ class PttWebCrawler(object):
                 article_id = args.a
                 self.parse_article(article_id, board)
 
-    def parse_articles(self, start, end, board, path='data', timeout=3):
+    def parse_articles(self, start, end, board, path='data', timeout=3, save_locally=False):
         today = datetime.today().strftime('%Y%m%d')
         filename = f"{board}-{start}-{end}-{today}.json"
         filename = os.path.join(path, filename)
@@ -92,7 +92,8 @@ class PttWebCrawler(object):
                 except:
                     pass
             time.sleep(0.1)
-        self.store(filename, all_data)
+        if save_locally:
+            self.store(filename, all_data)
         return all_data
 
     def parse_article(self, article_id, board, path='data'):
@@ -216,6 +217,7 @@ class PttWebCrawler(object):
     def store(filename, data, mode='w'):
         with open(filename, mode) as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
+        print(f"Saved to {filename}")
 
     @staticmethod
     def get(filename, mode='r'):
