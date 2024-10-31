@@ -23,6 +23,7 @@ def to_mongo(data):
                     upsert=True
                 ))
             ptt_data.bulk_write(bulk_operations)
+            print(f"{len(bulk_operations)} articles inserted")
     except Exception as e:
         print(e)
 
