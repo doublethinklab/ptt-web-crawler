@@ -22,7 +22,12 @@ if sys.version_info[0] < 3:
     VERIFY = False
     requests.packages.urllib3.disable_warnings()
 
-
+def extract_author_id(s):
+    match = re.search(r'^(.*?)\s*\(.*\)', s)
+    if match:
+        return match.group(1).strip()  # 去除前後的空白
+    else:
+        return None
 class PttWebCrawler(object):
 
     PTT_URL = 'https://www.ptt.cc'
@@ -111,7 +116,7 @@ class PttWebCrawler(object):
         title = ''
         date = ''
         if metas:
-            author = metas[0].select('span.article-meta-value')[0].string if metas[0].select('span.article-meta-value')[0] else author
+            author = extract_author_id(metas[0].select('span.article-meta-value')[0].string) if metas[0].select('span.article-meta-value')[0] else author
             title = metas[1].select('span.article-meta-value')[0].string if metas[1].select('span.article-meta-value')[0] else title
             date = metas[2].select('span.article-meta-value')[0].string if metas[2].select('span.article-meta-value')[0] else date
 
