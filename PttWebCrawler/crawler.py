@@ -73,24 +73,27 @@ class PttWebCrawler(object):
         for i in range(end - start + 1):
             index = start + i
             print('Processing index:', str(index))
-            resp = requests.get(
-                url=f"{self.PTT_URL}/bbs/{board}/index{index}.html",
-                cookies={'over18': '1'}, verify=VERIFY, timeout=timeout
-            )
-            if resp.status_code != 200:
-                print('invalid url:', resp.url)
-                continue
-            soup = BeautifulSoup(resp.text, 'lxml')
-            divs = soup.find_all("div", "r-ent")
-            for div in divs:
-                try:
-                    # ex. link would be <a href="/bbs/PublicServan/M.1127742013.A.240.html">Re: [問題] 職等</a>
-                    href = div.find('a')['href']
-                    link = self.PTT_URL + href
-                    article_id = re.sub('\.html', '', href.split('/')[-1])
-                    all_data.append(self.parse(link, article_id, board))
-                except:
-                    pass
+            try:
+                resp = requests.get(
+                    url=f"{self.PTT_URL}/bbs/{board}/index{index}.html",
+                    cookies={'over18': '1'}, verify=VERIFY, timeout=timeout
+                )
+                if resp.status_code != 200:
+                    print('invalid url:', resp.url)
+                    continue
+                soup = BeautifulSoup(resp.text, 'lxml')
+                divs = soup.find_all("div", "r-ent")
+                for div in divs:
+                    try:
+                        # ex. link would be <a href="/bbs/PublicServan/M.1127742013.A.240.html">Re: [問題] 職等</a>
+                        href = div.find('a')['href']
+                        link = self.PTT_URL + href
+                        article_id = re.sub('\.html', '', href.split('/')[-1])
+                        all_data.append(self.parse(link, article_id, board))
+                    except:
+                        pass
+            except requests.exceptions.ReadTimeout:
+                pass
             time.sleep(0.1)
         if save_locally:
             self.store(filename, all_data)

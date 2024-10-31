@@ -24,8 +24,8 @@ def to_mongo(data):
         ptt_data.bulk_write(bulk_operations)
 
 c = PttWebCrawler(as_lib=True)
+to_mongo(c.parse_articles(0, 10, 'joke', save_locally=True))
+to_mongo(c.parse_articles(0, 10, 'Military', save_locally=True))
 to_mongo(c.parse_articles(0, 50, 'HatePolitics', save_locally=True))  # 1 index = 20 articles
 to_mongo(c.parse_articles(0, 50, 'Gossiping', save_locally=True))
 to_mongo(c.parse_articles(0, 25, 'Womentalk', save_locally=True))
-to_mongo(c.parse_articles(0, 10, 'joke', save_locally=True))
-to_mongo(c.parse_articles(0, 10, 'Military', save_locally=True))
