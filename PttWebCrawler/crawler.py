@@ -198,7 +198,7 @@ class PttWebCrawler(object):
             'article_id': article_id,
             'article_title': title,
             'author': author,
-            'datetime_utc8': publish_time_utc8,
+            'datetime_utc8': publish_time_utc8.strftime('%Y-%m-%d %H:%M:%S'),
             'date': date_,
             'time': time_,
             'content': content,
