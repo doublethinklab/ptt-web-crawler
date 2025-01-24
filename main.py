@@ -28,8 +28,8 @@ def to_mongo(data):
         print(e)
 
 c = PttWebCrawler(as_lib=True)
-to_mongo(c.parse_articles(0, 10, 'joke', save_locally=True))
-to_mongo(c.parse_articles(0, 10, 'Military', save_locally=True))
-to_mongo(c.parse_articles(0, 500, 'HatePolitics', save_locally=True))  # 1 index = 20 articles
-to_mongo(c.parse_articles(0, 500, 'Gossiping', save_locally=True))
-to_mongo(c.parse_articles(0, 250, 'Womentalk', save_locally=True))
+to_mongo(c.parse_articles(0, 10, 'joke', save_locally=False))
+to_mongo(c.parse_articles(0, 10, 'Military', save_locally=False))
+to_mongo(c.parse_articles(0, 500, 'HatePolitics', save_locally=False))  # 1 index = 20 articles
+to_mongo(c.parse_articles(0, 500, 'Gossiping', save_locally=False))
+to_mongo(c.parse_articles(0, 250, 'Womentalk', save_locally=False))
