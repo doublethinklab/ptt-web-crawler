@@ -13,6 +13,7 @@ import codecs
 from bs4 import BeautifulSoup
 from six import u
 from datetime import datetime, timedelta
+from utils import BatchSaver
 
 __version__ = '1.0'
 
@@ -69,7 +70,7 @@ class PttWebCrawler(object):
         today = datetime.today().strftime('%Y%m%d')
         filename = f"{board}-{start}-{end}-{today}.json"
         filename = os.path.join(path, filename)
-        all_data = []
+        all_data = BatchSaver()
         for i in range(end - start + 1):
             index = start + i
             print('Processing index:', str(index))
@@ -89,14 +90,14 @@ class PttWebCrawler(object):
                         href = div.find('a')['href']
                         link = self.PTT_URL + href
                         article_id = re.sub('\.html', '', href.split('/')[-1])
-                        all_data.append(self.parse(link, article_id, board))
+                        all_data.add(self.parse(link, article_id, board))
                     except:
                         pass
             except requests.exceptions.ReadTimeout:
                 pass
             time.sleep(0.1)
         if save_locally:
-            self.store(filename, all_data)
+            self.store(filename, all_data.data)
         return all_data
 
     def parse_article(self, article_id, board, path='data'):
