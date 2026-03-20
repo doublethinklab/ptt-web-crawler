@@ -1,6 +1,12 @@
 PATH=/root/ptt-web-crawler
 cd $PATH
-source venv/bin/activate && python main.py
+source venv/bin/activate
+
+for board in joke Military Womentalk HatePolitics Gossiping
+do
+  python -m PttWebCrawler -b "$board" --mode daily --days 1
+done
+
 deactivate
 cd -
 
