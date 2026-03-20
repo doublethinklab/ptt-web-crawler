@@ -34,19 +34,37 @@ def extract_author_id(s):
 
 class PttWebCrawler(object):
     PTT_URL = 'https://www.ptt.cc'
+    DEFAULT_HEADERS = {
+        'User-Agent': (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/122.0.0.0 Safari/537.36'
+        ),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+    }
 
     """docstring for PttWebCrawler"""
 
     def __init__(self, cmdline=None, as_lib=False):
+        self.session = requests.Session()
+        self.session.headers.update(self.DEFAULT_HEADERS)
+        self.session.cookies.update({'over18': '1'})
+
         parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, description='''
             A crawler for the web version of PTT, the largest online community in Taiwan.
             Input: board name and page indices (or articla ID)
             Output: BOARD_NAME-START_INDEX-END_INDEX.json (or BOARD_NAME-ID.json)
         ''')
         parser.add_argument('-b', metavar='BOARD_NAME', help='Board name', required=True)
-        group = parser.add_mutually_exclusive_group(required=True)
+        group = parser.add_mutually_exclusive_group(required=False)
         group.add_argument('-i', metavar=('START_INDEX', 'END_INDEX'), type=int, nargs=2, help="Start and end index")
         group.add_argument('-a', metavar='ARTICLE_ID', help="Article ID")
+        group.add_argument('--mode', choices=['all', 'daily'], help='Crawl mode')
+        parser.add_argument('--date', help='Target date in YYYY-MM-DD')
+        parser.add_argument('--days', type=int, default=1, help='Number of days to crawl backward from --date')
         parser.add_argument('-v', '--version', action='version', version='%(prog)s ' + __version__)
 
         if not as_lib:
@@ -62,22 +80,33 @@ class PttWebCrawler(object):
                 else:
                     end = args.i[1]
                 self.parse_articles(start, end, board)
-            else:  # args.a
+            elif args.a:
                 article_id = args.a
                 self.parse_article(article_id, board)
+            elif args.mode:
+                target_date = self.parse_date_arg(args.date) if args.date else datetime.today().date()
+                if args.days < 1:
+                    parser.error('--days must be greater than or equal to 1')
+                if args.mode == 'all':
+                    self.parse_all_articles(board)
+                else:
+                    self.parse_articles_by_date(board, target_date=target_date, days=args.days)
+            else:
+                parser.error('one of -i, -a, or --mode is required')
 
     def parse_articles(self, start, end, board, path='data', timeout=3, save_locally=False):
         today = datetime.today().strftime('%Y%m%d')
         filename = f"{board}-{start}-{end}-{today}.json"
         filename = os.path.join(path, filename)
         all_data = BatchSaver()
+        local_data = []
         for i in range(end - start + 1):
             index = start + i
             print('Processing index:', str(index))
             try:
-                resp = requests.get(
+                resp = self.session.get(
                     url=f"{self.PTT_URL}/bbs/{board}/index{index}.html",
-                    cookies={'over18': '1'}, verify=VERIFY, timeout=timeout
+                    verify=VERIFY, timeout=timeout
                 )
                 if resp.status_code != 200:
                     print('invalid url:', resp.url)
@@ -86,19 +115,61 @@ class PttWebCrawler(object):
                 divs = soup.find_all("div", "r-ent")
                 for div in divs:
                     try:
+                        anchor = div.find('a')
+                        if not anchor:
+                            continue
                         # ex. link would be <a href="/bbs/PublicServan/M.1127742013.A.240.html">Re: [問題] 職等</a>
-                        href = div.find('a')['href']
+                        href = anchor['href']
                         link = self.PTT_URL + href
                         article_id = re.sub('\.html', '', href.split('/')[-1])
-                        all_data.add(self.parse(link, article_id, board))
-                    except:
-                        pass
-            except requests.exceptions.ReadTimeout:
-                pass
+                        article = self.parse(link, article_id, board, timeout=timeout, session=self.session)
+                        all_data.add(article)
+                        if save_locally:
+                            local_data.append(article)
+                    except Exception as exc:
+                        print(f'failed to parse article on {board} index {index}: {exc}')
+            except requests.exceptions.RequestException as exc:
+                print(f'failed to fetch board page {board} index {index}: {exc}')
             time.sleep(0.1)
+
+        all_data.flush()
         if save_locally:
-            self.store(filename, all_data.data)
+            self.store(filename, local_data)
         return all_data
+
+    def parse_articles_by_date(self, board, target_date=None, days=1, path='data', timeout=3, save_locally=False):
+        if target_date is None:
+            target_date = datetime.today().date()
+        if days < 1:
+            raise ValueError('days must be greater than or equal to 1')
+
+        start_date = target_date - timedelta(days=days - 1)
+        if days == 1:
+            filename = os.path.join(path, f"{board}-{target_date.strftime('%Y%m%d')}.json")
+        else:
+            filename = os.path.join(
+                path,
+                f"{board}-{start_date.strftime('%Y%m%d')}-{target_date.strftime('%Y%m%d')}.json"
+            )
+        return self._crawl_by_date_range(
+            board=board,
+            start_date=start_date,
+            end_date=target_date,
+            filename=filename,
+            timeout=timeout,
+            save_locally=save_locally,
+        )
+
+    def parse_all_articles(self, board, path='data', timeout=3, save_locally=False):
+        filename = os.path.join(path, f"{board}-all.json")
+        return self._crawl_by_date_range(
+            board=board,
+            start_date=None,
+            end_date=None,
+            filename=filename,
+            timeout=timeout,
+            save_locally=save_locally,
+        )
 
     def parse_article(self, article_id, board, path='data'):
         today = datetime.today().strftime('%Y%m%d')
@@ -109,14 +180,20 @@ class PttWebCrawler(object):
         return filename
 
     @staticmethod
-    def parse(link, article_id, board, timeout=3):
+    def parse(link, article_id, board, timeout=3, session=None):
         print(f'Processing article of {board}:', article_id)
-        resp = requests.get(url=link, cookies={'over18': '1'}, verify=VERIFY, timeout=timeout)
+        http = session or requests.Session()
+        if session is None:
+            http.headers.update(PttWebCrawler.DEFAULT_HEADERS)
+            http.cookies.update({'over18': '1'})
+
+        resp = http.get(url=link, verify=VERIFY, timeout=timeout)
         if resp.status_code != 200:
-            print('invalid url:', resp.url)
-            return json.dumps({"error": "invalid url"}, sort_keys=True, ensure_ascii=False)
+            raise ValueError(f'invalid url: {resp.url}')
         soup = BeautifulSoup(resp.text, 'lxml')
         main_content = soup.find(id="main-content")
+        if main_content is None:
+            raise ValueError(f'main-content not found for {resp.url}')
         metas = main_content.select('div.article-metaline')
         author = ''
         title = ''
@@ -187,10 +264,14 @@ class PttWebCrawler(object):
         # print 'msgs', messages
         # print 'mscounts', message_count
 
-        publish_time_utc8 = datetime.strptime(date, '%a %b %d %H:%M:%S %Y')
-        publish_time_utc = publish_time_utc8 - timedelta(hours=8)
-        date_ = publish_time_utc.strftime('%Y-%m-%d')
-        time_ = publish_time_utc.strftime('%H:%M:%S')
+        publish_time_utc8 = None
+        date_ = ''
+        time_ = ''
+        if date:
+            publish_time_utc8 = datetime.strptime(date, '%a %b %d %H:%M:%S %Y')
+            publish_time_utc = publish_time_utc8 - timedelta(hours=8)
+            date_ = publish_time_utc.strftime('%Y-%m-%d')
+            time_ = publish_time_utc.strftime('%H:%M:%S')
 
         # json data
         data = {
@@ -199,7 +280,7 @@ class PttWebCrawler(object):
             'article_id': article_id,
             'article_title': title,
             'author': author,
-            'datetime_utc8': publish_time_utc8.strftime('%Y-%m-%d %H:%M:%S'),
+            'datetime_utc8': publish_time_utc8.strftime('%Y-%m-%d %H:%M:%S') if publish_time_utc8 else '',
             'date': date_,
             'time': time_,
             'content': content,
@@ -209,11 +290,90 @@ class PttWebCrawler(object):
         }
         return data
 
+    def _crawl_by_date_range(self, board, start_date, end_date, filename, timeout=3, save_locally=False):
+        latest_page = self.getLastPage(board, timeout=timeout)
+        batch_saver = BatchSaver()
+        local_data = []
+        should_stop = False
+
+        for page_index in range(latest_page, 0, -1):
+            print('Processing index:', str(page_index))
+            try:
+                resp = self.session.get(
+                    url=self._build_index_url(board, page_index, latest_page),
+                    verify=VERIFY,
+                    timeout=timeout
+                )
+                if resp.status_code != 200:
+                    print('invalid url:', resp.url)
+                    continue
+                soup = BeautifulSoup(resp.text, 'lxml')
+                divs = soup.find_all("div", "r-ent")
+                if not divs:
+                    continue
+
+                for div in divs:
+                    anchor = div.find('a')
+                    if not anchor:
+                        continue
+
+                    href = anchor['href']
+                    link = self.PTT_URL + href
+                    article_id = re.sub('\.html', '', href.split('/')[-1])
+                    try:
+                        article = self.parse(link, article_id, board, timeout=timeout, session=self.session)
+                    except Exception as exc:
+                        print(f'failed to parse article on {board} index {page_index}: {exc}')
+                        continue
+
+                    article_date = self.article_date(article)
+                    if (start_date or end_date) and article_date is None:
+                        print(f'skipping article without datetime on {board}: {article_id}')
+                        continue
+                    if end_date and article_date and article_date > end_date:
+                        continue
+                    if start_date and article_date and article_date < start_date:
+                        should_stop = True
+                        break
+
+                    batch_saver.add(article)
+                    if save_locally:
+                        local_data.append(article)
+
+                if should_stop:
+                    break
+            except requests.exceptions.RequestException as exc:
+                print(f'failed to fetch board page {board} index {page_index}: {exc}')
+            time.sleep(0.1)
+
+        batch_saver.flush()
+        if save_locally:
+            self.store(filename, local_data)
+        return batch_saver
+
+    @staticmethod
+    def article_date(article):
+        datetime_utc8 = article.get('datetime_utc8')
+        if not datetime_utc8:
+            return None
+        return datetime.strptime(datetime_utc8, '%Y-%m-%d %H:%M:%S').date()
+
+    @staticmethod
+    def parse_date_arg(date_text):
+        return datetime.strptime(date_text, '%Y-%m-%d').date()
+
+    def _build_index_url(self, board, page_index, latest_page):
+        if page_index == latest_page:
+            return f'{self.PTT_URL}/bbs/{board}/index.html'
+        return f'{self.PTT_URL}/bbs/{board}/index{page_index}.html'
+
     @staticmethod
     def getLastPage(board, timeout=3):
         content = requests.get(
             url='https://www.ptt.cc/bbs/' + board + '/index.html',
-            cookies={'over18': '1'}, timeout=timeout
+            headers=PttWebCrawler.DEFAULT_HEADERS,
+            cookies={'over18': '1'},
+            timeout=timeout
         ).content.decode('utf-8')
         first_page = re.search(r'href="/bbs/' + board + '/index(\d+).html">&lsaquo;', content)
         if first_page is None:
@@ -222,6 +382,9 @@ class PttWebCrawler(object):
 
     @staticmethod
     def store(filename, data, mode='w'):
+        directory = os.path.dirname(filename)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         with open(filename, mode) as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
         print(f"Saved to {filename}")

@@ -45,6 +45,8 @@
 ```commandline
 python crawler.py -b 看板名稱 -i 起始索引 結束索引 (設為負數則以倒數第幾頁計算) 
 python crawler.py -b 看板名稱 -a 文章ID 
+python crawler.py -b 看板名稱 --mode daily --date YYYY-MM-DD --days N
+python crawler.py -b 看板名稱 --mode all
 ```
 
 ### 範例
@@ -74,6 +76,21 @@ from PttWebCrawler.crawler import *
 
 c = PttWebCrawler(as_lib=True)
 c.parse_articles(100, 200, 'PublicServan')
+c.parse_articles_by_date('PublicServan', target_date=datetime(2026, 3, 20).date(), days=1)
+c.parse_all_articles('PublicServan')
+```
+
+### 依日期抓取
+
+```commandline
+# 抓指定日期的全部文章
+python -m PttWebCrawler -b Gossiping --mode daily --date 2026-03-20
+
+# 從指定日期往前抓 7 天
+python -m PttWebCrawler -b Gossiping --mode daily --date 2026-03-20 --days 7
+
+# 抓整個板的全部文章
+python -m PttWebCrawler -b Gossiping --mode all
 ```
 
 ### 測試

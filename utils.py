@@ -29,18 +29,29 @@ def to_mongo(data):
     try:
         bulk_operations = []
         if data:
+            if ptt_data is None:
+                raise RuntimeError('MONGODB_URI is not configured; cannot write crawler results to MongoDB.')
             for article in data:
                 bulk_operations.append(UpdateOne(
-                    {'article_id': article.get('article_id')},
+                    {
+                        'board': article.get('board'),
+                        'article_id': article.get('article_id')
+                    },
                     {'$set': article},
                     upsert=True
                 ))
             ptt_data.bulk_write(bulk_operations)
             print(f"{len(bulk_operations)} articles inserted")
     except Exception as e:
-        print(e)
+        print(f'failed to write articles to MongoDB: {e}')
 
 
-client = pymongo.MongoClient(os.getenv('MONGODB_URI'))
-dtl_data = client['dtl_data']
-ptt_data = dtl_data['ptt_data']
+mongo_uri = os.getenv('MONGODB_URI')
+if mongo_uri:
+    client = pymongo.MongoClient(mongo_uri)
+    dtl_data = client['dtl_data']
+    ptt_data = dtl_data['ptt_data']
+else:
+    client = None
+    dtl_data = None
+    ptt_data = None

@@ -4,8 +4,5 @@ from dotenv import load_dotenv
 load_dotenv()
 
 c = PttWebCrawler(as_lib=True)
-c.parse_articles(0, 10, 'joke', save_locally=False)
-c.parse_articles(0, 10, 'Military', save_locally=False)
-c.parse_articles(0, 250, 'Womentalk', save_locally=False)
-c.parse_articles(0, 500, 'HatePolitics', save_locally=False)  # 1 index = 20 articles
-c.parse_articles(0, 500, 'Gossiping', save_locally=False)
+for board in ['joke', 'Military', 'Womentalk', 'HatePolitics', 'Gossiping']:
+    c.parse_articles_by_date(board, days=1, save_locally=False)
