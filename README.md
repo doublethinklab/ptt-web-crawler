@@ -46,8 +46,13 @@
 python crawler.py -b 看板名稱 -i 起始索引 結束索引 (設為負數則以倒數第幾頁計算) 
 python crawler.py -b 看板名稱 -a 文章ID 
 python crawler.py -b 看板名稱 --mode daily --date YYYY-MM-DD --days N
+python crawler.py -b 看板名稱 --mode daily --offset N
+python crawler.py -b 看板名稱 --mode scan
 python crawler.py -b 看板名稱 --mode all
 ```
+
+`--date` 與 `--offset` 皆以 UTC+8 計算，與伺服器時區無關。`--offset N` 代表「今天往前推 N 天」，
+未指定 `--date` 時使用；兩者同時給定時以 `--date` 為準。
 
 ### 範例
 
@@ -77,6 +82,7 @@ from PttWebCrawler.crawler import *
 c = PttWebCrawler(as_lib=True)
 c.parse_articles(100, 200, 'PublicServan')
 c.parse_articles_by_date('PublicServan', target_date=datetime(2026, 3, 20).date(), days=1)
+c.scan_new_articles('PublicServan')
 c.parse_all_articles('PublicServan')
 ```
 
@@ -89,9 +95,53 @@ python -m PttWebCrawler -b Gossiping --mode daily --date 2026-03-20
 # 從指定日期往前抓 7 天
 python -m PttWebCrawler -b Gossiping --mode daily --date 2026-03-20 --days 7
 
+# 抓前一天的全部文章 (UTC+8)
+python -m PttWebCrawler -b Gossiping --mode daily --offset 1
+
 # 抓整個板的全部文章
 python -m PttWebCrawler -b Gossiping --mode all
 ```
+
+### 日內增量掃描 (scan)
+
+```commandline
+python -m PttWebCrawler -b Gossiping --mode scan
+```
+
+`scan` 只讀看板列表頁，用文章 ID 內嵌的發文時間 (`M.<epoch>.A.xxx`) 判斷日期，
+再比對 MongoDB 已存的 `article_id`，只抓沒抓過的文章。
+
+用途是在當天稍後補上會在隔夜完整補抓前被刪除的文章。成本約為每個列表頁一次請求，
+若當天文章都已抓過則完全不發文章請求。
+
+### 完整度檢查
+
+每個看板跑完會輸出一行統計：
+
+```
+[Gossiping] 2026-09-16 listed=857 fetched=857 saved=857 existing=0 out_of_range=0 failed=0 failed_pages=0 save_failures=0 coverage=100.0%
+```
+
+* `listed` — 列表頁判定屬於該日期區間的文章數
+* `out_of_range` — ID 時間落在區間內、但文章實際發文時間不在區間內 (跨日邊界的正常現象)
+* `coverage` — `(saved + existing + out_of_range) / listed`
+
+`coverage` 低於 99%、有文章抓取失敗、有列表頁抓取失敗、或有寫入失敗時，
+行程會以 exit code 1 結束，方便 cron 或監控察覺。
+
+### 排程
+
+`run.sh` 接受 `daily` (預設) 與 `scan` 兩種模式：
+
+```commandline
+# 每天 02:00 (UTC+8) 完整補抓前一天，涵蓋全部看板
+0 18 * * * /root/ptt-web-crawler/run.sh daily
+
+# 每天 10:00 / 14:00 / 18:00 / 22:00 (UTC+8) 對 HatePolitics、Gossiping 做增量掃描
+0 2,6,10,14 * * * /root/ptt-web-crawler/run.sh scan
+```
+
+日誌寫到 `logs/ptt-<mode>-<YYYYMMDD>.log`。
 
 ### 測試
 ```commandline

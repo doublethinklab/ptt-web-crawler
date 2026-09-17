@@ -12,16 +12,37 @@ import time
 import codecs
 from bs4 import BeautifulSoup
 from six import u
-from datetime import datetime, timedelta
-from utils import BatchSaver
+from datetime import datetime, timedelta, timezone
+from utils import BatchSaver, find_existing_article_ids
 
-__version__ = '1.0'
+__version__ = '1.1'
 
 # if python 2, disable verify flag in requests.get()
 VERIFY = True
 if sys.version_info[0] < 3:
     VERIFY = False
     requests.packages.urllib3.disable_warnings()
+
+# PTT publishes in UTC+8. Pin the timezone so the crawler behaves identically
+# no matter how the host machine's clock is configured.
+TZ8 = timezone(timedelta(hours=8))
+
+# Article ids and article meta dates can disagree by a few seconds, so a single
+# out-of-range article near midnight must not end the crawl. Stop only after
+# this many consecutive older articles (roughly two index pages).
+OUT_OF_RANGE_THRESHOLD = 40
+
+MAX_RETRIES = 3
+RETRY_BACKOFF = 1.0
+# PTT sits behind Cloudflare, which returns 52x for transient origin problems
+RETRYABLE_STATUS = (408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
+
+DEFAULT_TIMEOUT = 10
+REQUEST_INTERVAL = 0.1
+
+# A run is considered complete when at least this share of the articles listed
+# on the index pages ended up accounted for.
+COVERAGE_THRESHOLD = 99.0
 
 
 def extract_author_id(s):
@@ -30,6 +51,80 @@ def extract_author_id(s):
         return match.group(1).strip()  # 去除前後的空白
     else:
         return None
+
+
+def fetch_with_retry(http, url, timeout=DEFAULT_TIMEOUT, retries=MAX_RETRIES):
+    """GET a PTT url, retrying transient failures with exponential backoff.
+
+    Without this a single timeout used to silently drop a whole index page
+    (20 articles) from the day's results.
+    """
+    last_error = None
+    for attempt in range(retries):
+        try:
+            resp = http.get(url=url, verify=VERIFY, timeout=timeout)
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code in RETRYABLE_STATUS:
+                last_error = f'HTTP {resp.status_code}'
+            else:
+                raise ValueError(f'invalid url: {resp.url} (HTTP {resp.status_code})')
+        except requests.exceptions.RequestException as exc:
+            last_error = exc
+        if attempt < retries - 1:
+            time.sleep(RETRY_BACKOFF * (2 ** attempt))
+    raise requests.exceptions.RequestException(
+        f'failed after {retries} attempts: {url} ({last_error})'
+    )
+
+
+class CrawlReport(object):
+    """Per-board bookkeeping so a run can prove it captured the whole day."""
+
+    def __init__(self, board, label):
+        self.board = board
+        self.label = label
+        self.listed = 0             # articles the index pages say are in range
+        self.fetched = 0            # articles parsed successfully
+        self.skipped_existing = 0   # already in MongoDB (scan mode only)
+        self.out_of_range = 0       # id timestamp in range but meta date was not
+        self.failed = []            # article ids that could not be parsed
+        self.failed_pages = []      # index pages that could not be fetched
+        self.saved = 0
+        self.save_failures = 0
+
+    @property
+    def accounted(self):
+        return self.saved + self.skipped_existing + self.out_of_range
+
+    @property
+    def coverage(self):
+        if self.listed == 0:
+            return 100.0
+        return self.accounted * 100.0 / self.listed
+
+    def is_complete(self):
+        return (
+            not self.failed
+            and not self.failed_pages
+            and self.save_failures == 0
+            and self.coverage >= COVERAGE_THRESHOLD
+        )
+
+    def render(self):
+        print(
+            f'[{self.board}] {self.label} '
+            f'listed={self.listed} fetched={self.fetched} saved={self.saved} '
+            f'existing={self.skipped_existing} out_of_range={self.out_of_range} '
+            f'failed={len(self.failed)} failed_pages={len(self.failed_pages)} '
+            f'save_failures={self.save_failures} coverage={self.coverage:.1f}%'
+        )
+        if self.failed:
+            print(f'[{self.board}] failed articles: {", ".join(self.failed)}')
+        if self.failed_pages:
+            print(f'[{self.board}] failed index pages: {self.failed_pages}')
+        if not self.is_complete():
+            print(f'[{self.board}] INCOMPLETE: day was not fully captured')
 
 
 class PttWebCrawler(object):
@@ -62,9 +157,11 @@ class PttWebCrawler(object):
         group = parser.add_mutually_exclusive_group(required=False)
         group.add_argument('-i', metavar=('START_INDEX', 'END_INDEX'), type=int, nargs=2, help="Start and end index")
         group.add_argument('-a', metavar='ARTICLE_ID', help="Article ID")
-        group.add_argument('--mode', choices=['all', 'daily'], help='Crawl mode')
-        parser.add_argument('--date', help='Target date in YYYY-MM-DD')
+        group.add_argument('--mode', choices=['all', 'daily', 'scan'], help='Crawl mode')
+        parser.add_argument('--date', help='Target date in YYYY-MM-DD (UTC+8)')
         parser.add_argument('--days', type=int, default=1, help='Number of days to crawl backward from --date')
+        parser.add_argument('--offset', type=int, default=0,
+                            help='Days before today (UTC+8) to use as target date; ignored when --date is given')
         parser.add_argument('-v', '--version', action='version', version='%(prog)s ' + __version__)
 
         if not as_lib:
@@ -84,73 +181,88 @@ class PttWebCrawler(object):
                 article_id = args.a
                 self.parse_article(article_id, board)
             elif args.mode:
-                target_date = self.parse_date_arg(args.date) if args.date else datetime.today().date()
                 if args.days < 1:
                     parser.error('--days must be greater than or equal to 1')
-                if args.mode == 'all':
-                    self.parse_all_articles(board)
+                if args.offset < 0:
+                    parser.error('--offset must be greater than or equal to 0')
+                if args.date:
+                    target_date = self.parse_date_arg(args.date)
                 else:
-                    self.parse_articles_by_date(board, target_date=target_date, days=args.days)
+                    target_date = self.today() - timedelta(days=args.offset)
+
+                if args.mode == 'all':
+                    report = self.parse_all_articles(board)
+                elif args.mode == 'scan':
+                    report = self.scan_new_articles(board, target_date=target_date)
+                else:
+                    report = self.parse_articles_by_date(board, target_date=target_date, days=args.days)
+
+                if report is not None and not report.is_complete():
+                    sys.exit(1)
             else:
                 parser.error('one of -i, -a, or --mode is required')
 
-    def parse_articles(self, start, end, board, path='data', timeout=3, save_locally=False):
-        today = datetime.today().strftime('%Y%m%d')
+    def parse_articles(self, start, end, board, path='data', timeout=DEFAULT_TIMEOUT, save_locally=False):
+        today = self.today().strftime('%Y%m%d')
         filename = f"{board}-{start}-{end}-{today}.json"
         filename = os.path.join(path, filename)
-        all_data = BatchSaver()
+        report = CrawlReport(board, f'index {start}-{end}')
+        batch_saver = BatchSaver()
         local_data = []
         for i in range(end - start + 1):
             index = start + i
             print('Processing index:', str(index))
             try:
-                resp = self.session.get(
-                    url=f"{self.PTT_URL}/bbs/{board}/index{index}.html",
-                    verify=VERIFY, timeout=timeout
+                resp = fetch_with_retry(
+                    self.session,
+                    f"{self.PTT_URL}/bbs/{board}/index{index}.html",
+                    timeout=timeout
                 )
-                if resp.status_code != 200:
-                    print('invalid url:', resp.url)
-                    continue
-                soup = BeautifulSoup(resp.text, 'lxml')
-                divs = soup.find_all("div", "r-ent")
-                for div in divs:
-                    try:
-                        anchor = div.find('a')
-                        if not anchor:
-                            continue
-                        # ex. link would be <a href="/bbs/PublicServan/M.1127742013.A.240.html">Re: [問題] 職等</a>
-                        href = anchor['href']
-                        link = self.PTT_URL + href
-                        article_id = re.sub('\.html', '', href.split('/')[-1])
-                        article = self.parse(link, article_id, board, timeout=timeout, session=self.session)
-                        all_data.add(article)
-                        if save_locally:
-                            local_data.append(article)
-                    except Exception as exc:
-                        print(f'failed to parse article on {board} index {index}: {exc}')
-            except requests.exceptions.RequestException as exc:
+            except (requests.exceptions.RequestException, ValueError) as exc:
                 print(f'failed to fetch board page {board} index {index}: {exc}')
-            time.sleep(0.1)
+                report.failed_pages.append(index)
+                continue
 
-        all_data.flush()
+            soup = BeautifulSoup(resp.text, 'lxml')
+            for article_id, link, _pinned in self._index_entries(soup):
+                report.listed += 1
+                try:
+                    article = self.parse(link, article_id, board, timeout=timeout, session=self.session)
+                except Exception as exc:
+                    print(f'failed to parse article on {board} index {index}: {exc}')
+                    report.failed.append(article_id)
+                    continue
+                report.fetched += 1
+                batch_saver.add(article)
+                if save_locally:
+                    local_data.append(article)
+            time.sleep(REQUEST_INTERVAL)
+
+        batch_saver.flush()
+        report.saved = batch_saver.saved_count
+        report.save_failures = batch_saver.failed_count
         if save_locally:
             self.store(filename, local_data)
-        return all_data
+        report.render()
+        return report
 
-    def parse_articles_by_date(self, board, target_date=None, days=1, path='data', timeout=3, save_locally=False):
+    def parse_articles_by_date(self, board, target_date=None, days=1, path='data',
+                               timeout=DEFAULT_TIMEOUT, save_locally=False):
         if target_date is None:
-            target_date = datetime.today().date()
+            target_date = self.today()
         if days < 1:
             raise ValueError('days must be greater than or equal to 1')
 
         start_date = target_date - timedelta(days=days - 1)
         if days == 1:
             filename = os.path.join(path, f"{board}-{target_date.strftime('%Y%m%d')}.json")
+            label = f'{target_date}'
         else:
             filename = os.path.join(
                 path,
                 f"{board}-{start_date.strftime('%Y%m%d')}-{target_date.strftime('%Y%m%d')}.json"
             )
+            label = f'{start_date}..{target_date}'
         return self._crawl_by_date_range(
             board=board,
             start_date=start_date,
@@ -158,9 +270,10 @@ class PttWebCrawler(object):
             filename=filename,
             timeout=timeout,
             save_locally=save_locally,
+            label=label,
         )
 
-    def parse_all_articles(self, board, path='data', timeout=3, save_locally=False):
+    def parse_all_articles(self, board, path='data', timeout=DEFAULT_TIMEOUT, save_locally=False):
         filename = os.path.join(path, f"{board}-all.json")
         return self._crawl_by_date_range(
             board=board,
@@ -169,10 +282,62 @@ class PttWebCrawler(object):
             filename=filename,
             timeout=timeout,
             save_locally=save_locally,
+            label='all',
         )
 
+    def scan_new_articles(self, board, target_date=None, path='data',
+                          timeout=DEFAULT_TIMEOUT, save_locally=False):
+        """Lightweight intraday pass.
+
+        Walks index pages only and derives each article's publish time from its
+        id, then fetches just the articles MongoDB has never seen. This catches
+        posts that would be deleted before the nightly full crawl runs, at a
+        cost of roughly one request per index page.
+        """
+        if target_date is None:
+            target_date = self.today()
+        board = self.resolve_board_name(board, timeout=timeout)
+        report = CrawlReport(board, f'scan {target_date}')
+
+        candidates = self._collect_index_entries(
+            board=board,
+            start_date=target_date,
+            end_date=target_date,
+            report=report,
+            timeout=timeout,
+        )
+        report.listed = len(candidates)
+
+        existing = find_existing_article_ids(board, [article_id for article_id, _ in candidates])
+        report.skipped_existing = sum(1 for article_id, _ in candidates if article_id in existing)
+
+        batch_saver = BatchSaver()
+        local_data = []
+        for article_id, link in candidates:
+            if article_id in existing:
+                continue
+            try:
+                article = self.parse(link, article_id, board, timeout=timeout, session=self.session)
+            except Exception as exc:
+                print(f'failed to parse article on {board}: {exc}')
+                report.failed.append(article_id)
+                continue
+            report.fetched += 1
+            batch_saver.add(article)
+            if save_locally:
+                local_data.append(article)
+            time.sleep(REQUEST_INTERVAL)
+
+        batch_saver.flush()
+        report.saved = batch_saver.saved_count
+        report.save_failures = batch_saver.failed_count
+        if save_locally:
+            self.store(os.path.join(path, f"{board}-scan-{target_date.strftime('%Y%m%d')}.json"), local_data)
+        report.render()
+        return report
+
     def parse_article(self, article_id, board, path='data'):
-        today = datetime.today().strftime('%Y%m%d')
+        today = self.today().strftime('%Y%m%d')
         link = f"{self.PTT_URL}/bbs/{board}/{article_id}.html"
         filename = f'{board}-{article_id}-{today}.json'
         filename = os.path.join(path, filename)
@@ -180,16 +345,14 @@ class PttWebCrawler(object):
         return filename
 
     @staticmethod
-    def parse(link, article_id, board, timeout=3, session=None):
+    def parse(link, article_id, board, timeout=DEFAULT_TIMEOUT, session=None):
         print(f'Processing article of {board}:', article_id)
         http = session or requests.Session()
         if session is None:
             http.headers.update(PttWebCrawler.DEFAULT_HEADERS)
             http.cookies.update({'over18': '1'})
 
-        resp = http.get(url=link, verify=VERIFY, timeout=timeout)
-        if resp.status_code != 200:
-            raise ValueError(f'invalid url: {resp.url}')
+        resp = fetch_with_retry(http, link, timeout=timeout)
         soup = BeautifulSoup(resp.text, 'lxml')
         main_content = soup.find(id="main-content")
         if main_content is None:
@@ -290,66 +453,185 @@ class PttWebCrawler(object):
         }
         return data
 
-    def _crawl_by_date_range(self, board, start_date, end_date, filename, timeout=3, save_locally=False):
+    def _collect_index_entries(self, board, start_date, end_date, report, timeout=DEFAULT_TIMEOUT):
+        """Page backwards through the board index and list the in-range articles.
+
+        Only index pages are fetched here; publish times come from the article
+        id, so this costs one request per page instead of one per article.
+        """
         latest_page = self.getLastPage(board, timeout=timeout)
-        batch_saver = BatchSaver()
-        local_data = []
-        should_stop = False
+        entries = []
+        out_of_range_streak = 0
 
         for page_index in range(latest_page, 0, -1):
             print('Processing index:', str(page_index))
             try:
-                resp = self.session.get(
-                    url=self._build_index_url(board, page_index, latest_page),
-                    verify=VERIFY,
+                resp = fetch_with_retry(
+                    self.session,
+                    self._build_index_url(board, page_index, latest_page),
                     timeout=timeout
                 )
-                if resp.status_code != 200:
-                    print('invalid url:', resp.url)
-                    continue
-                soup = BeautifulSoup(resp.text, 'lxml')
-                divs = soup.find_all("div", "r-ent")
-                if not divs:
-                    continue
-
-                for div in divs:
-                    anchor = div.find('a')
-                    if not anchor:
-                        continue
-
-                    href = anchor['href']
-                    link = self.PTT_URL + href
-                    article_id = re.sub('\.html', '', href.split('/')[-1])
-                    try:
-                        article = self.parse(link, article_id, board, timeout=timeout, session=self.session)
-                    except Exception as exc:
-                        print(f'failed to parse article on {board} index {page_index}: {exc}')
-                        continue
-
-                    article_date = self.article_date(article)
-                    if (start_date or end_date) and article_date is None:
-                        print(f'skipping article without datetime on {board}: {article_id}')
-                        continue
-                    if end_date and article_date and article_date > end_date:
-                        continue
-                    if start_date and article_date and article_date < start_date:
-                        should_stop = True
-                        break
-
-                    batch_saver.add(article)
-                    if save_locally:
-                        local_data.append(article)
-
-                if should_stop:
-                    break
-            except requests.exceptions.RequestException as exc:
+            except (requests.exceptions.RequestException, ValueError) as exc:
                 print(f'failed to fetch board page {board} index {page_index}: {exc}')
-            time.sleep(0.1)
+                report.failed_pages.append(page_index)
+                continue
+
+            soup = BeautifulSoup(resp.text, 'lxml')
+            should_stop = False
+            for article_id, link, pinned in self._index_entries(soup):
+                published = self.article_id_datetime(article_id)
+                published_date = published.date() if published else None
+
+                if published_date is not None:
+                    if end_date and published_date > end_date:
+                        continue
+                    if start_date and published_date < start_date:
+                        # Pinned announcements sit at the bottom of the newest
+                        # page and are years old; letting them count here used
+                        # to end the crawl on the very first page.
+                        if not pinned:
+                            out_of_range_streak += 1
+                            if out_of_range_streak >= OUT_OF_RANGE_THRESHOLD:
+                                should_stop = True
+                                break
+                        continue
+                    if not pinned:
+                        out_of_range_streak = 0
+
+                entries.append((article_id, link))
+
+            if should_stop:
+                break
+            time.sleep(REQUEST_INTERVAL)
+
+        self._retry_failed_pages(board, latest_page, start_date, end_date, report, entries, timeout)
+        return entries
+
+    def _retry_failed_pages(self, board, latest_page, start_date, end_date, report, entries, timeout):
+        """Give index pages that failed outright one more pass.
+
+        A dropped index page silently costs the day 20 articles, so failures are
+        collected during the sweep and retried once the pressure of the sweep is
+        over. Pages still failing here stay in the report and fail the run.
+        """
+        pending = list(report.failed_pages)
+        if not pending:
+            return
+        print(f'retrying {len(pending)} failed index page(s) on {board}')
+        report.failed_pages = []
+        seen = {article_id for article_id, _ in entries}
+        for page_index in pending:
+            time.sleep(RETRY_BACKOFF)
+            try:
+                resp = fetch_with_retry(
+                    self.session,
+                    self._build_index_url(board, page_index, latest_page),
+                    timeout=timeout
+                )
+            except (requests.exceptions.RequestException, ValueError) as exc:
+                print(f'failed to fetch board page {board} index {page_index}: {exc}')
+                report.failed_pages.append(page_index)
+                continue
+
+            soup = BeautifulSoup(resp.text, 'lxml')
+            for article_id, link, pinned in self._index_entries(soup):
+                if article_id in seen:
+                    continue
+                published = self.article_id_datetime(article_id)
+                published_date = published.date() if published else None
+                if published_date is not None:
+                    if end_date and published_date > end_date:
+                        continue
+                    if start_date and published_date < start_date:
+                        continue
+                entries.append((article_id, link))
+                seen.add(article_id)
+
+    def _crawl_by_date_range(self, board, start_date, end_date, filename,
+                             timeout=DEFAULT_TIMEOUT, save_locally=False, label=None):
+        board = self.resolve_board_name(board, timeout=timeout)
+        report = CrawlReport(board, label or 'all')
+        entries = self._collect_index_entries(
+            board=board,
+            start_date=start_date,
+            end_date=end_date,
+            report=report,
+            timeout=timeout,
+        )
+        report.listed = len(entries)
+
+        batch_saver = BatchSaver()
+        local_data = []
+        for article_id, link in entries:
+            try:
+                article = self.parse(link, article_id, board, timeout=timeout, session=self.session)
+            except Exception as exc:
+                print(f'failed to parse article on {board}: {exc}')
+                report.failed.append(article_id)
+                continue
+
+            # The id timestamp is when composing started; the meta date is the
+            # authoritative publish time and decides what actually gets stored.
+            article_date = self.article_date(article)
+            if (start_date or end_date) and article_date is None:
+                print(f'skipping article without datetime on {board}: {article_id}')
+                report.out_of_range += 1
+                continue
+            if end_date and article_date > end_date:
+                report.out_of_range += 1
+                continue
+            if start_date and article_date < start_date:
+                report.out_of_range += 1
+                continue
+
+            report.fetched += 1
+            batch_saver.add(article)
+            if save_locally:
+                local_data.append(article)
+            time.sleep(REQUEST_INTERVAL)
 
         batch_saver.flush()
+        report.saved = batch_saver.saved_count
+        report.save_failures = batch_saver.failed_count
         if save_locally:
             self.store(filename, local_data)
-        return batch_saver
+        report.render()
+        return report
+
+    @staticmethod
+    def _index_entries(soup):
+        """Yield (article_id, link, pinned) for every article on an index page.
+
+        Entries after the r-list-sep divider are pinned announcements: their
+        dates say nothing about where the page sits in the board's history.
+        """
+        container = soup.find('div', class_='r-list-container')
+        nodes = container.find_all('div', recursive=False) if container else soup.find_all('div', class_='r-ent')
+        pinned = False
+        for node in nodes:
+            classes = node.get('class') or []
+            if 'r-list-sep' in classes:
+                pinned = True
+                continue
+            if 'r-ent' not in classes:
+                continue
+            anchor = node.find('a')
+            if not anchor or not anchor.get('href'):
+                continue  # deleted article
+            href = anchor['href']
+            article_id = re.sub(r'\.html$', '', href.split('/')[-1])
+            yield article_id, PttWebCrawler.PTT_URL + href, pinned
+
+    @staticmethod
+    def article_id_datetime(article_id):
+        """PTT article ids embed the publish epoch: M.<epoch>.A.<hash>."""
+        match = re.match(r'^M\.(\d+)\.A', article_id)
+        if not match:
+            return None
+        try:
+            return datetime.fromtimestamp(int(match.group(1)), TZ8)
+        except (ValueError, OverflowError, OSError):
+            return None
 
     @staticmethod
     def article_date(article):
@@ -357,6 +639,10 @@ class PttWebCrawler(object):
         if not datetime_utc8:
             return None
         return datetime.strptime(datetime_utc8, '%Y-%m-%d %H:%M:%S').date()
+
+    @staticmethod
+    def today():
+        return datetime.now(TZ8).date()
 
     @staticmethod
     def parse_date_arg(date_text):
@@ -367,16 +653,48 @@ class PttWebCrawler(object):
             return f'{self.PTT_URL}/bbs/{board}/index.html'
         return f'{self.PTT_URL}/bbs/{board}/index{page_index}.html'
 
+    @classmethod
+    def _board_session(cls):
+        session = requests.Session()
+        session.headers.update(cls.DEFAULT_HEADERS)
+        session.cookies.update({'over18': '1'})
+        return session
+
+    @classmethod
+    def resolve_board_name(cls, board, timeout=DEFAULT_TIMEOUT):
+        """Return the board's canonical spelling as PTT reports it.
+
+        PTT resolves board urls case-insensitively, so a misspelled board still
+        returns 200 while writing an inconsistent `board` value to MongoDB.
+        """
+        session = cls._board_session()
+        try:
+            resp = fetch_with_retry(session, f'{cls.PTT_URL}/bbs/{board}/index.html', timeout=timeout)
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            print(f'cannot resolve canonical name of board {board}: {exc}')
+            return board
+        match = re.search(r'href="/bbs/([^/"]+)/index\d*\.html"', resp.content.decode('utf-8'))
+        if not match:
+            return board
+        canonical = match.group(1)
+        if canonical != board:
+            print(f'board name normalized: {board} -> {canonical}')
+        return canonical
+
     @staticmethod
-    def getLastPage(board, timeout=3):
-        content = requests.get(
-            url='https://www.ptt.cc/bbs/' + board + '/index.html',
-            headers=PttWebCrawler.DEFAULT_HEADERS,
-            cookies={'over18': '1'},
+    def getLastPage(board, timeout=DEFAULT_TIMEOUT):
+        session = PttWebCrawler._board_session()
+        resp = fetch_with_retry(
+            session,
+            f'{PttWebCrawler.PTT_URL}/bbs/{board}/index.html',
             timeout=timeout
-        ).content.decode('utf-8')
-        first_page = re.search(r'href="/bbs/' + board + '/index(\d+).html">&lsaquo;', content)
+        )
+        content = resp.content.decode('utf-8')
+        # Do not embed the requested board name: PTT echoes its own spelling, so
+        # a case mismatch would silently fall through to page 1.
+        first_page = re.search(r'href="/bbs/[^/"]+/index(\d+)\.html">&lsaquo;', content)
         if first_page is None:
+            print(f'no paging link on {board}; treating the board as a single page')
             return 1
         return int(first_page.group(1)) + 1
 
